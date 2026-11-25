@@ -95,6 +95,8 @@ struct PracticeStep: Hashable {
     let start: Double
     let pitches: Set<Int>
     let eventIDs: Set<UUID>
+    /// 0 부터 시작하는 마디 번호
+    let measureIndex: Int
 }
 
 extension Score {
@@ -114,18 +116,22 @@ extension Score {
         return result.sorted { $0.start < $1.start }
     }
 
-    func practiceSteps(staves: Set<Staff>) -> [PracticeStep] {
-        let notes = timeline(staves: staves).filter { !$0.pitches.isEmpty }
-        var groups: [Double: (Set<Int>, Set<UUID>)] = [:]
+    /// measures: 이 마디(0 부터)만 연습. nil 이면 전체.
+    func practiceSteps(staves: Set<Staff>, measures only: Set<Int>? = nil) -> [PracticeStep] {
+        let notes = timeline(staves: staves).filter {
+            !$0.pitches.isEmpty && (only?.contains($0.measureIndex) ?? true)
+        }
+        var groups: [Double: (pitches: Set<Int>, ids: Set<UUID>, measure: Int)] = [:]
         for n in notes {
             let key = (n.start * 1000).rounded() / 1000
-            var g = groups[key] ?? ([], [])
-            g.0.formUnion(n.pitches)
-            g.1.insert(n.id)
+            var g = groups[key] ?? ([], [], n.measureIndex)
+            g.pitches.formUnion(n.pitches)
+            g.ids.insert(n.id)
             groups[key] = g
         }
         return groups.keys.sorted().map { k in
-            PracticeStep(start: k, pitches: groups[k]!.0, eventIDs: groups[k]!.1)
+            let g = groups[k]!
+            return PracticeStep(start: k, pitches: g.pitches, eventIDs: g.ids, measureIndex: g.measure)
         }
     }
 }

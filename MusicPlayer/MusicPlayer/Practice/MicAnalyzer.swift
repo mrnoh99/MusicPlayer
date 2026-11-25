@@ -182,13 +182,21 @@ enum NoteMatcher {
             return m
         }
 
-        // 1) 기대한 음이 들리는지: 기음 또는 2·3배음
+        // 1) 기대한 음이 들리는지
+        //    낮은 음(E3 아래)은 휴대폰 마이크에서 기음이 약해 2·3배음으로 보완.
+        //    그 위의 음은 기음이 있어야 인정 → 한 옥타브 위를 친 것을 '맞음'으로 착각하지 않음.
+        var present: [Int] = []
         for n in expected {
             let fr = frequency(n)
-            var strength = peak(near: fr)
-            strength = max(strength, peak(near: fr * 2) * 0.9)
-            if n < 52 { strength = max(strength, peak(near: fr * 3) * 0.8) }
+            let fundamental = peak(near: fr)
+            var strength = fundamental
+            if n < 52 {
+                strength = max(strength, peak(near: fr * 2) * 0.9, peak(near: fr * 3) * 0.8)
+            } else if fundamental > threshold * 0.35 {
+                strength = max(strength, peak(near: fr * 2) * 0.9)
+            }
             if strength > threshold { result.matched.insert(n) }
+            if strength > threshold || fundamental > threshold * 0.35 { present.append(n) }
         }
 
         // 2) 스펙트럼 피크 → 기대한 음의 배음으로 설명되지 않으면 틀린 음 후보
@@ -216,7 +224,8 @@ enum NoteMatcher {
         }
 
         var wrongCandidates: [(midi: Int, freq: Double)] = []
-        for p in strong where !explained(p.freq, by: Array(expected)) {
+        // 실제로 소리가 나는 기대 음의 배음만 '설명됨'으로 처리 (옥타브 실수 검출)
+        for p in strong where !explained(p.freq, by: present) {
             wrongCandidates.append((midi(for: p.freq), p.freq))
         }
         // 다른 후보의 배음이면 제외 (낮은 음 우선)

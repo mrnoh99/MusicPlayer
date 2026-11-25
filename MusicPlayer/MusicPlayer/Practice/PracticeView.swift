@@ -19,6 +19,9 @@ struct PracticeView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                if let focus = session.focusMeasures {
+                    focusBanner(focus)
+                }
                 ScoreCanvasView(score: score, highlights: scoreHighlights,
                                 focusEventID: session.current?.eventIDs.first)
 
@@ -26,6 +29,7 @@ struct PracticeView: View {
                     feedbackCard
                     PianoKeyboardView(lowest: keyRange.lowerBound, highest: keyRange.upperBound,
                                       colors: keyColors) { midi in
+                        session.ignoreMic(for: 0.9)
                         PianoSynth.shared.preview([midi], seconds: 0.5)
                     }
                     .frame(height: 110)
@@ -57,6 +61,11 @@ struct PracticeView: View {
                                 Text("높음 (조용한 곳)").tag(1.6)
                             }
                         }
+                        if session.report != nil {
+                            Button { session.showReport = true } label: {
+                                Label("지난 결과 보기", systemImage: "chart.bar")
+                            }
+                        }
                     } label: {
                         Image(systemName: "slider.horizontal.3")
                     }
@@ -68,15 +77,54 @@ struct PracticeView: View {
             } message: {
                 Text(session.errorMessage ?? "")
             }
+            .sheet(isPresented: $session.showReport) {
+                if let report = session.report {
+                    PracticeReportView(report: report, preferFlats: preferFlats,
+                                       isPartial: session.focusMeasures != nil,
+                                       onRetryWeak: { session.practice(measures: Set(report.weakMeasures.map(\.measure))) },
+                                       onRestart: {
+                                           session.showReport = false
+                                           session.restart()
+                                       },
+                                       onWholePiece: { session.practiceWholePiece() })
+                    .presentationDetents([.medium, .large])
+                }
+            }
+            .sensoryFeedback(.success, trigger: session.successTick)
+            .sensoryFeedback(.error, trigger: session.errorTick)
             .onDisappear { session.stop() }
         }
     }
 
+    private func focusBanner(_ focus: Set<Int>) -> some View {
+        HStack {
+            Image(systemName: "scope")
+            Text("\(focus.sorted().map { "\($0 + 1)" }.joined(separator: ", "))마디만 연습 중")
+                .font(.subheadline.weight(.medium))
+            Spacer()
+            Button("곡 전체로") { session.practiceWholePiece() }
+                .font(.subheadline)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.15))
+    }
+
     // MARK: 색 표시
 
+    /// 이미 친 음은 결과대로(초록=한 번에, 주황=틀린 뒤 맞힘, 회색=건너뜀), 지금 칠 음은 파랑/빨강
     private var scoreHighlights: [UUID: Color] {
         var h: [UUID: Color] = [:]
-        for id in session.lastCorrectIDs { h[id] = .green }
+        for (step, r) in zip(session.steps, session.results) {
+            let color: Color?
+            switch r.status {
+            case .clean: color = .green
+            case .recovered: color = .orange
+            case .skipped: color = .gray
+            case .pending: color = nil
+            }
+            if let color { for id in step.eventIDs { h[id] = color } }
+        }
         if let step = session.current {
             let color: Color
             if case .wrong = session.feedback { color = .red } else { color = .blue }
@@ -103,30 +151,48 @@ struct PracticeView: View {
                 .font(.system(size: 34))
                 .foregroundStyle(feedbackColor)
                 .frame(width: 44)
+                .contentTransition(.symbolEffect(.replace))
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(feedbackTitle).font(.headline)
+                HStack(spacing: 6) {
+                    Text(feedbackTitle).font(.headline).lineLimit(1).minimumScaleFactor(0.7)
+                    if session.streak >= 3 {
+                        Text("🔥 \(session.streak)연속")
+                            .font(.caption.weight(.bold))
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(Color.orange.opacity(0.2)))
+                    }
+                }
                 Text(feedbackDetail)
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(detailColor)
                     .lineLimit(2)
                 ProgressView(value: session.progress)
+                    .tint(feedbackColor)
             }
 
             Spacer(minLength: 0)
 
             VStack(alignment: .trailing, spacing: 4) {
-                Label("\(session.correctCount)", systemImage: "checkmark").foregroundStyle(.green)
-                Label("\(session.mistakeCount)", systemImage: "xmark").foregroundStyle(.red)
+                if let acc = session.liveAccuracy {
+                    Text("\(acc)%").font(.title3.weight(.bold).monospacedDigit())
+                        .foregroundStyle(acc >= 90 ? Color.green : acc >= 70 ? Color.orange : Color.red)
+                }
+                HStack(spacing: 8) {
+                    Label("\(session.cleanCount)", systemImage: "checkmark").foregroundStyle(.green)
+                    Label("\(session.mistakeCount)", systemImage: "xmark").foregroundStyle(.red)
+                }
                 LevelMeter(level: session.level).frame(width: 60, height: 6)
             }
             .font(.caption.monospacedDigit())
         }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 12).fill(feedbackColor.opacity(0.08)))
+        .animation(.easeOut(duration: 0.2), value: session.feedback)
     }
 
     private func names(_ pitches: [Int]) -> String {
-        pitches.map { "\(NoteName.name($0, preferFlats: preferFlats))(\(NoteName.korean($0)))" }
-            .joined(separator: ", ")
+        NoteName.display(pitches, preferFlats: preferFlats)
     }
 
     private var targetText: String {
@@ -134,39 +200,56 @@ struct PracticeView: View {
         return names(step.pitches.sorted())
     }
 
+    private var positionText: String {
+        guard let step = session.current else { return "" }
+        return "\(step.measureIndex + 1)마디 · \(session.index + 1)/\(session.steps.count)"
+    }
+
     private var feedbackTitle: String {
         switch session.feedback {
-        case .idle: return session.steps.isEmpty ? "연습할 음표가 없습니다" : "시작을 누르고 피아노를 쳐 보세요"
+        case .idle:
+            if session.steps.isEmpty { return "연습할 음표가 없습니다" }
+            return session.index > 0 ? "멈춤 · 칠 음: \(targetText)" : "시작을 누르고 피아노를 쳐 보세요"
         case .waiting: return "칠 음: \(targetText)"
-        case .correct: return "좋아요! 다음: \(targetText)"
-        case .partial(let missing): return "빠진 음이 있어요: \(names(missing))"
+        case .correct(let clean):
+            let praise = clean ? (session.streak >= 5 ? "멋져요!" : "좋아요!") : "맞았어요!"
+            return "\(praise) 다음: \(targetText)"
+        case .partial(let missing): return "빠진 음: \(names(missing))"
         case .wrong(let played, _): return "틀린 음: \(names(played))"
         case .finished: return "끝까지 연주했습니다 🎉"
         }
     }
 
     private var feedbackDetail: String {
+        if session.isStuck, session.isListening, session.feedback != .finished {
+            return "어렵다면 🔊 들어보기로 소리를 듣거나, 화면 건반의 파란 건반을 확인하세요."
+        }
         switch session.feedback {
         case .idle:
-            return "파란색으로 표시된 음을 치면 마이크로 듣고 맞았는지 알려 줍니다."
+            return session.steps.isEmpty ? "" : "파란색으로 표시된 음을 치면 마이크로 듣고 맞았는지 알려 줍니다."
         case .waiting, .correct:
-            return session.isListening ? "듣고 있습니다… (\(session.index + 1)/\(session.steps.count))" : ""
+            return session.isListening ? "듣고 있어요… \(positionText)" : positionText
         case .partial:
-            return "칠 음: \(targetText)"
-        case .wrong(_, let expected):
-            return "눌러야 할 음: \(names(expected))"
+            return "화음의 모든 음을 동시에 눌러 주세요 · 칠 음: \(targetText)"
+        case .wrong(let played, let expected):
+            let hint = MistakeHint.text(played: played, expected: Set(expected))
+            return hint.isEmpty ? "눌러야 할 음: \(names(expected))" : hint
         case .finished:
-            let total = session.correctCount + session.mistakeCount
-            let rate = total == 0 ? 100 : Int(Double(session.correctCount) / Double(total) * 100)
-            return "맞은 음 \(session.correctCount)개 · 틀린 횟수 \(session.mistakeCount)회 · 정확도 \(rate)%"
+            guard let r = session.report else { return "" }
+            return "한 번에 맞힘 \(r.accuracy)% · 틀린 횟수 \(r.totalMistakes)회 · 결과 보기는 오른쪽 위 메뉴"
         }
+    }
+
+    private var detailColor: Color {
+        if case .wrong = session.feedback { return .red }
+        return .secondary
     }
 
     private var feedbackIcon: String {
         switch session.feedback {
         case .idle: return "music.note"
-        case .waiting: return "ear"
-        case .correct: return "checkmark.circle.fill"
+        case .waiting: return session.isStuck ? "questionmark.circle" : "ear"
+        case .correct(let clean): return clean ? "checkmark.circle.fill" : "checkmark.circle"
         case .partial: return "exclamationmark.circle.fill"
         case .wrong: return "xmark.circle.fill"
         case .finished: return "star.circle.fill"
@@ -176,7 +259,8 @@ struct PracticeView: View {
     private var feedbackColor: Color {
         switch session.feedback {
         case .idle, .waiting: return .blue
-        case .correct, .finished: return .green
+        case .correct(let clean): return clean ? .green : .orange
+        case .finished: return .green
         case .partial: return .orange
         case .wrong: return .red
         }
@@ -187,6 +271,7 @@ struct PracticeView: View {
     private var controls: some View {
         HStack(spacing: 14) {
             Button { session.previous() } label: { Image(systemName: "backward.end.fill") }
+                .accessibilityLabel("이전 음 다시")
             Button { session.playCurrent() } label: { Label("들어보기", systemImage: "speaker.wave.2.fill") }
                 .disabled(session.current == nil)
 
@@ -202,7 +287,9 @@ struct PracticeView: View {
             .disabled(session.steps.isEmpty)
 
             Button { session.next() } label: { Image(systemName: "forward.end.fill") }
+                .accessibilityLabel("건너뛰기")
             Button { session.restart() } label: { Image(systemName: "arrow.counterclockwise") }
+                .accessibilityLabel("처음부터")
         }
         .buttonStyle(.bordered)
     }
