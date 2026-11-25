@@ -16,7 +16,7 @@ enum OMRError: LocalizedError {
         case .noImages: return "인식할 이미지가 없습니다."
         case .http(let code, let msg): return "서버 오류 (\(code)): \(msg)"
         case .refused(let msg): return "요청이 거절되었습니다. \(msg)"
-        case .truncated: return "악보가 너무 길어 응답이 잘렸습니다. 페이지를 나눠서 인식해 보세요."
+        case .truncated: return "한 페이지의 악보가 너무 길어 응답이 잘렸습니다. 그 페이지를 위·아래 반씩 잘라 찍어서 다시 시도해 보세요."
         case .badResponse(let msg): return "응답을 해석하지 못했습니다: \(msg)"
         }
     }
@@ -28,41 +28,134 @@ struct OMRService {
 
     var apiKey: String
 
-    /// 인식 진행 단계 (화면 표시용)
-    enum Stage: String {
-        case preparing = "사진을 다듬는 중"
-        case reading = "AI가 악보를 읽는 중"
-        case verifying = "AI가 원본과 대조해 검토하는 중"
+    /// 인식 진행 상황 (화면 표시용)
+    struct Progress: Sendable {
+        enum Stage: String, Sendable {
+            case preparing = "사진을 다듬는 중"
+            case reading = "AI가 악보를 읽는 중"
+            case verifying = "AI가 원본과 대조해 검토하는 중"
+        }
+        var stage: Stage
+        var done = 0
+        var total = 0
     }
 
+    /// 속도와 정확도 사이의 선택
+    enum Mode: String, CaseIterable, Identifiable, Sendable {
+        case fast, balanced, precise
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .fast: return "빠르게"
+            case .balanced: return "보통"
+            case .precise: return "정밀하게"
+            }
+        }
+        var detail: String {
+            switch self {
+            case .fast: return "가장 빠릅니다. 단순한 악보에 알맞고, 복잡한 악보는 틀린 곳이 늘 수 있어요."
+            case .balanced: return "속도와 정확도의 균형. 대부분의 악보에 알맞습니다."
+            case .precise: return "AI가 한 번 더 원본과 대조해 고칩니다. 가장 정확하지만 시간·비용이 약 2배입니다."
+            }
+        }
+        var effort: String {
+            switch self {
+            case .fast: return "low"
+            case .balanced: return "medium"
+            case .precise: return "high"
+            }
+        }
+        var verify: Bool { self == .precise }
+    }
+
+    /// 한 번에 동시에 보낼 페이지 수
+    private static let maxParallelPages = 4
+
     /// 악보 이미지 → Score.
-    /// verify 가 true 면 AI 가 첫 결과를 원본과 마디마다 다시 대조해 고칩니다 (더 정확, 시간·비용 약 2배).
-    func recognize(images: [UIImage], titleHint: String?, verify: Bool = true,
-                   progress: @escaping @Sendable (Stage) -> Void = { _ in }) async throws -> Score {
+    /// 페이지마다 따로, 동시에 요청해서 여러 쪽짜리 악보도 한 쪽을 읽는 시간 정도에 끝납니다.
+    /// fastSpeed: Claude 고속 처리(fast mode) — 출력이 최대 2.5배 빠르지만 요금이 2배.
+    func recognize(images: [UIImage], titleHint: String?, mode: Mode = .balanced, fastSpeed: Bool = false,
+                   progress: @escaping @Sendable (Progress) -> Void = { _ in }) async throws -> Score {
         guard !apiKey.isEmpty else { throw OMRError.missingAPIKey }
         guard !images.isEmpty else { throw OMRError.noImages }
 
-        progress(.preparing)
-        // 기울어진 사진은 펴고, 그림자·색을 줄여 대비를 높임
-        let pages = images.map { ImagePreprocessor.prepare($0) }
-        let imageBlocks = Self.imageContent(pages)
+        progress(Progress(stage: .preparing))
+        // 기울어진 사진은 펴고, 그림자·색을 줄여 대비를 높임 (여러 장을 동시에)
+        let pages = await withTaskGroup(of: (Int, UIImage).self) { group in
+            for (i, image) in images.enumerated() {
+                group.addTask { (i, ImagePreprocessor.prepare(image)) }
+            }
+            var result = [UIImage?](repeating: nil, count: images.count)
+            for await (i, img) in group { result[i] = img }
+            return result.enumerated().map { $0.element ?? images[$0.offset] }
+        }
 
-        progress(.reading)
-        var instruction = "Transcribe all \(pages.count) page(s) above, in order, into the JSON format."
+        let total = pages.count * (mode.verify ? 2 : 1)
+        let counter = ProgressCounter(total: total, report: progress)
+        counter.start(.reading)
+
+        // 페이지별로 동시에 읽기 (+ 정밀 모드면 그 페이지를 바로 검토)
+        let work: @Sendable (Int) async throws -> (Int, OMRResult) = { index in
+            try await self.readPage(pages[index], number: index + 1, of: pages.count,
+                                    titleHint: titleHint, mode: mode, fastSpeed: fastSpeed, counter: counter)
+        }
+        let results: [OMRResult] = try await withThrowingTaskGroup(of: (Int, OMRResult).self) { group in
+            var next = 0
+            while next < min(Self.maxParallelPages, pages.count) {
+                let index = next
+                group.addTask { try await work(index) }
+                next += 1
+            }
+            var out = [OMRResult?](repeating: nil, count: pages.count)
+            while let item = try await group.next() {
+                out[item.0] = item.1
+                if next < pages.count {
+                    let index = next
+                    group.addTask { try await work(index) }
+                    next += 1
+                }
+            }
+            return out.compactMap { $0 }
+        }
+
+        // 페이지 결과 이어 붙이기 (제목·박자·조표는 첫 페이지 기준)
+        guard var merged = results.first else { throw OMRError.badResponse("결과가 없습니다") }
+        merged.measures = []
+        for (k, r) in results.enumerated() {
+            if merged.title.isEmpty { merged.title = r.title }
+            if merged.composer.isEmpty { merged.composer = r.composer }
+            merged.measures += r.measures.map { m in var c = m; c.page = k + 1; return c }
+        }
+
+        // 원본 이미지를 보관해 두면 편집할 때 나란히 보며 고칠 수 있음
+        let names: [String?] = pages.map { PageImageStore.save($0) }
+        return merged.toScore(fallbackTitle: titleHint, pageImages: names)
+    }
+
+    /// 한 페이지 읽기 (+ 정밀 모드면 검토)
+    private func readPage(_ page: UIImage, number: Int, of count: Int, titleHint: String?,
+                          mode: Mode, fastSpeed: Bool, counter: ProgressCounter) async throws -> (Int, OMRResult) {
+        let image = Self.imageContent([page])
+        var instruction = "Transcribe this page into the JSON format. Use page 1 for every measure."
+        if count > 1 {
+            instruction += " It is page \(number) of \(count) of the piece"
+            instruction += number > 1 ? "; if the title, tempo, time or key signature are not printed on this page, give your best guess from the music and use an empty title." : "."
+        }
         if let hint = titleHint, !hint.isEmpty { instruction += " The user calls this piece \"\(hint)\"." }
-        let firstData = try await send(system: Self.systemPrompt, schema: Self.schema,
-                                       content: imageBlocks + [["type": "text", "text": instruction]])
-        var result = try decode(OMRResult.self, from: firstData)
 
-        if verify {
+        let firstData = try await send(system: Self.systemPrompt, schema: Self.schema,
+                                       content: image + [["type": "text", "text": instruction]],
+                                       effort: mode.effort, fastSpeed: fastSpeed)
+        var result = try decode(OMRResult.self, from: firstData)
+        counter.step(mode.verify ? .verifying : .reading)
+
+        if mode.verify {
             try Task.checkCancellation()
-            progress(.verifying)
-            let draft = String(data: firstData, encoding: .utf8) ?? ""
             var review = """
-            Below is a first-pass transcription of the pages above. Proofread it against the images, \
+            Below is a first-pass transcription of the page above. Proofread it against the image, \
             measure by measure and staff by staff: wrong pitches (check clefs, ledger lines, key signature and \
             accidentals), wrong durations or dots, missing or extra notes, rests, chords, ties, articulations, \
-            dynamics, repeat barlines, page numbers, and missing or extra measures. \
+            dynamics, repeat barlines, and missing or extra measures. \
             Return the complete corrected transcription in the same JSON format.
             """
             let problems = result.rhythmProblems()
@@ -70,18 +163,17 @@ struct OMRService {
                 review += "\nThese measures do not add up to the time signature and need a closer look: "
                     + problems.joined(separator: "; ") + "."
             }
-            review += "\n\nFirst-pass transcription:\n" + draft
+            review += "\n\nFirst-pass transcription:\n" + (String(data: firstData, encoding: .utf8) ?? "")
             if let checked = try? await send(system: Self.systemPrompt, schema: Self.schema,
-                                             content: imageBlocks + [["type": "text", "text": review]]),
+                                             content: image + [["type": "text", "text": review]],
+                                             effort: "high", fastSpeed: fastSpeed),
                let corrected = try? decode(OMRResult.self, from: checked),
                !corrected.measures.isEmpty {
                 result = corrected
             }
+            counter.step(.verifying)
         }
-
-        // 원본 이미지를 보관해 두면 편집할 때 나란히 보며 고칠 수 있음
-        let names: [String?] = pages.map { PageImageStore.save($0) }
-        return result.toScore(fallbackTitle: titleHint, pageImages: names)
+        return (number - 1, result)
     }
 
     /// 편집 중 한 마디만 AI 로 다시 읽기. 원본 페이지 이미지와 앞뒤 마디를 단서로 줍니다.
@@ -109,7 +201,7 @@ struct OMRService {
         let data = try await send(system: Self.systemPrompt, schema: Self.measureSchema,
                                   content: Self.imageContent([ImagePreprocessor.prepare(pageImage)])
                                       + [["type": "text", "text": prompt]],
-                                  maxTokens: 8000)
+                                  maxTokens: 8000, effort: "high")
         let m = try decode(OMRMeasure.self, from: data)
         var measure = score.measures[mi]
         measure.events = m.events(measureLength: score.measureLength)
@@ -135,50 +227,89 @@ struct OMRService {
 
     /// Messages API 호출 → 구조화 출력(JSON) 텍스트
     private func send(system: String, schema: [String: Any], content: [[String: Any]],
-                      maxTokens: Int = 32000) async throws -> Data {
-        let body: [String: Any] = [
+                      maxTokens: Int = 64000, effort: String = "medium", fastSpeed: Bool = false) async throws -> Data {
+        do {
+            return try await sendOnce(system: system, schema: schema, content: content,
+                                      maxTokens: maxTokens, effort: effort, fastSpeed: fastSpeed)
+        } catch OMRError.http(let code, _) where fastSpeed && code == 429 {
+            // 고속 처리 한도에 걸리면 보통 속도로 다시
+            return try await sendOnce(system: system, schema: schema, content: content,
+                                      maxTokens: maxTokens, effort: effort, fastSpeed: false)
+        }
+    }
+
+    private func sendOnce(system: String, schema: [String: Any], content: [[String: Any]],
+                          maxTokens: Int, effort: String, fastSpeed: Bool) async throws -> Data {
+        var body: [String: Any] = [
             "model": Self.model,
             "max_tokens": maxTokens,
             "system": system,
             "messages": [["role": "user", "content": content]],
             "output_config": [
-                "effort": "high",
+                "effort": effort,
                 "format": ["type": "json_schema", "schema": schema],
             ],
             // 안전 분류기로 거절될 경우 서버가 자동으로 다른 모델로 재시도
             "fallbacks": "default",
         ]
+        if fastSpeed { body["speed"] = "fast" }
+
+        // 긴 응답도 끊기지 않도록 스트리밍으로 받음
+        body["stream"] = true
 
         var request = URLRequest(url: Self.endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 900
+        request.timeoutInterval = 300   // 데이터가 이만큼 오지 않으면 실패 (스트리밍이라 전체 시간 제한은 아님)
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         request.setValue("2026-10-21", forHTTPHeaderField: "anthropic-version")
         request.setValue("server-side-fallback-2026-07-01", forHTTPHeaderField: "anthropic-beta")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-
         guard (200..<300).contains(status) else {
+            var data = Data()
+            for try await b in bytes { data.append(b) }
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
             let message = (json["error"] as? [String: Any])?["message"] as? String
                 ?? String(data: data, encoding: .utf8) ?? ""
             throw OMRError.http(status, message)
         }
 
-        let stopReason = json["stop_reason"] as? String
+        // SSE: "data: {...}" 줄마다 이벤트 하나. 글자(text_delta)만 모으고 생각(thinking) 등은 건너뜀.
+        var text = ""
+        var stopReason: String?
+        var stopDetails: [String: Any]?
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard let data = payload.data(using: .utf8),
+                  let event = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+            switch event["type"] as? String {
+            case "content_block_delta":
+                if let delta = event["delta"] as? [String: Any], delta["type"] as? String == "text_delta",
+                   let t = delta["text"] as? String {
+                    text += t
+                }
+            case "message_delta":
+                if let delta = event["delta"] as? [String: Any] {
+                    if let r = delta["stop_reason"] as? String { stopReason = r }
+                    if let d = delta["stop_details"] as? [String: Any] { stopDetails = d }
+                }
+            case "error":
+                let message = (event["error"] as? [String: Any])?["message"] as? String ?? "알 수 없는 오류"
+                throw OMRError.http(529, message)
+            default:
+                break
+            }
+        }
+
         if stopReason == "refusal" {
-            let detail = (json["stop_details"] as? [String: Any])?["explanation"] as? String ?? ""
-            throw OMRError.refused(detail)
+            throw OMRError.refused(stopDetails?["explanation"] as? String ?? "")
         }
         if stopReason == "max_tokens" { throw OMRError.truncated }
-
-        let blocks = json["content"] as? [[String: Any]] ?? []
-        let text = blocks.filter { $0["type"] as? String == "text" }
-            .compactMap { $0["text"] as? String }
-            .joined()
         guard !text.isEmpty, let textData = text.data(using: .utf8) else { throw OMRError.badResponse("빈 응답") }
         return textData
     }
@@ -270,7 +401,35 @@ struct OMRService {
 
 // MARK: - 응답 형식
 
+/// 여러 페이지를 동시에 처리할 때 진행 상황 세기
+private final class ProgressCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = 0
+    private let total: Int
+    private let report: @Sendable (OMRService.Progress) -> Void
+
+    init(total: Int, report: @escaping @Sendable (OMRService.Progress) -> Void) {
+        self.total = total
+        self.report = report
+    }
+
+    func start(_ stage: OMRService.Progress.Stage) {
+        report(OMRService.Progress(stage: stage, done: 0, total: total))
+    }
+
+    func step(_ stage: OMRService.Progress.Stage) {
+        lock.lock()
+        done += 1
+        let d = done
+        lock.unlock()
+        report(OMRService.Progress(stage: stage, done: d, total: total))
+    }
+}
+
 private struct OMRResult: Decodable {
+    var title: String
+    var composer: String
+    var measures: [OMRMeasure]
     /// 박자 합이 맞지 않는 마디 (검토 단계에 단서로 전달). 첫 마디는 못갖춘마디일 수 있어 제외.
     func rhythmProblems() -> [String] {
         let unit = 4.0 / Double([2, 4, 8].contains(beatUnit) ? beatUnit : 4)
@@ -287,13 +446,10 @@ private struct OMRResult: Decodable {
         return Array(problems.prefix(30))
     }
 
-    let title: String
-    let composer: String
     let tempo: Int
     let beatsPerMeasure: Int
     let beatUnit: Int
     let keyFifths: Int
-    let measures: [OMRMeasure]
 
     /// pageImages: 페이지(이미지) 순서대로 저장한 원본 이미지 파일 이름
     func toScore(fallbackTitle: String?, pageImages: [String?] = []) -> Score {
@@ -328,7 +484,7 @@ private struct OMRResult: Decodable {
 private struct OMRMeasure: Decodable {
     let treble: [OMREvent]
     let bass: [OMREvent]
-    let page: Int?
+    var page: Int?
     let repeatStart: Bool?
     let repeatEnd: Bool?
 

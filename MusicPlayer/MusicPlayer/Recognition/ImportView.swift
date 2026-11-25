@@ -19,8 +19,11 @@ struct ImportView: View {
     @State private var errorMessage: String?
     @State private var showSettings = false
     @State private var task: Task<Void, Never>?
-    @State private var verify = true
-    @State private var stage: OMRService.Stage = .preparing
+    @AppStorage("omrMode") private var modeRaw = OMRService.Mode.balanced.rawValue
+    @AppStorage("omrFastSpeed") private var fastSpeed = false
+    @State private var progress = OMRService.Progress(stage: .preparing)
+
+    private var mode: OMRService.Mode { OMRService.Mode(rawValue: modeRaw) ?? .balanced }
 
     var body: some View {
         NavigationStack {
@@ -73,16 +76,24 @@ struct ImportView: View {
 
                 Section {
                     TextField("곡 제목 (선택)", text: $title)
-                    Toggle(isOn: $verify) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Picker("인식 방식", selection: $modeRaw) {
+                            ForEach(OMRService.Mode.allCases) { Text($0.label).tag($0.rawValue) }
+                        }
+                        .pickerStyle(.segmented)
+                        Text(mode.detail).font(.caption).foregroundStyle(.secondary)
+                    }
+                    .disabled(isWorking)
+                    Toggle(isOn: $fastSpeed) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("AI 2차 검토")
-                            Text("AI가 처음 읽은 결과를 원본과 마디마다 다시 대조해 고칩니다. 더 정확하지만 시간·비용이 약 2배입니다.")
+                            Text("고속 처리")
+                            Text("AI가 최대 2.5배 빨리 씁니다. API 요금은 2배입니다.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
                     .disabled(isWorking)
                 } footer: {
-                    Text("인식은 Claude(\(OMRService.model))가 이미지를 읽어 악보 데이터로 바꿉니다. 사진은 기울기를 펴고 흑백으로 다듬은 뒤 보냅니다. 인쇄된 악보에서 가장 정확하며, 틀린 곳은 편집 화면에서 원본과 비교하며 고치거나 'AI로 이 마디 다시 읽기'로 고칠 수 있습니다.")
+                    Text("인식은 Claude(\(OMRService.model))가 이미지를 읽어 악보 데이터로 바꿉니다. 사진은 기울기를 펴고 흑백으로 다듬은 뒤, 여러 페이지는 동시에 읽습니다. 인쇄된 악보에서 가장 정확하며, 틀린 곳은 편집 화면에서 원본과 비교하며 고치거나 'AI로 이 마디 다시 읽기'로 고칠 수 있습니다.")
                 }
 
                 Section {
@@ -90,7 +101,7 @@ struct ImportView: View {
                         TimelineView(.periodic(from: .now, by: 1)) { context in
                             HStack {
                                 ProgressView()
-                                Text("\(stage.rawValue)… \(Int(context.date.timeIntervalSince(startedAt)))초")
+                                Text(progressText + " · \(Int(context.date.timeIntervalSince(startedAt)))초")
                                     .padding(.leading, 8)
                             }
                         }
@@ -133,17 +144,24 @@ struct ImportView: View {
         }
     }
 
+    private var progressText: String {
+        var t = progress.stage.rawValue + "…"
+        if progress.total > 1 { t += " (\(progress.done)/\(progress.total))" }
+        return t
+    }
+
     private func recognize() {
         errorMessage = nil
         isWorking = true
         startedAt = Date()
+        progress = OMRService.Progress(stage: .preparing)
         let images = batch.images
         let hint = title
         task = Task {
             do {
                 let score = try await OMRService(apiKey: APIKeyStore.current)
-                    .recognize(images: images, titleHint: hint, verify: verify) { newStage in
-                        Task { @MainActor in stage = newStage }
+                    .recognize(images: images, titleHint: hint, mode: mode, fastSpeed: fastSpeed) { p in
+                        Task { @MainActor in progress = p }
                     }
                 if Task.isCancelled { return }
                 isWorking = false
