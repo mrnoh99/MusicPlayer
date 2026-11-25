@@ -5,7 +5,10 @@ struct PracticeView: View {
     let score: Score
 
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var progressStore: ProgressStore
     @StateObject private var session: PracticeSession
+    @State private var previousRecord: PracticeRecord?
+    @State private var resumeOffer: Int?
     private let keyRange: ClosedRange<Int>
 
     init(score: Score) {
@@ -19,7 +22,9 @@ struct PracticeView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                if let focus = session.focusMeasures {
+                if let m = resumeOffer, !session.isListening, session.index == 0 {
+                    resumeBanner(m)
+                } else if let focus = session.focusMeasures {
                     focusBanner(focus)
                 }
                 ScoreCanvasView(score: score, highlights: scoreHighlights,
@@ -44,6 +49,7 @@ struct PracticeView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("닫기") {
                         session.stop()
+                        saveResume()
                         dismiss()
                     }
                 }
@@ -80,7 +86,9 @@ struct PracticeView: View {
             .sheet(isPresented: $session.showReport) {
                 if let report = session.report {
                     PracticeReportView(report: report, preferFlats: preferFlats,
-                                       isPartial: session.focusMeasures != nil,
+                                       isPartial: session.focusMeasures != nil && !session.isResuming,
+                                       previous: previousRecord,
+                                       history: progressStore.progress(for: score.id).records,
                                        onRetryWeak: { session.practice(measures: Set(report.weakMeasures.map(\.measure))) },
                                        onRestart: {
                                            session.showReport = false
@@ -92,14 +100,85 @@ struct PracticeView: View {
             }
             .sensoryFeedback(.success, trigger: session.successTick)
             .sensoryFeedback(.error, trigger: session.errorTick)
-            .onDisappear { session.stop() }
+            .onAppear {
+                let p = progressStore.progress(for: score.id)
+                if let m = p.resumeMeasure, m > 0 { resumeOffer = m }
+            }
+            .onChange(of: session.report) { _, report in
+                guard let report else { return }
+                recordResult(report)
+            }
+            .onChange(of: session.isListening) { _, listening in
+                if !listening { saveResume() }
+            }
+            .onDisappear {
+                session.stop()
+                saveResume()
+            }
         }
+    }
+
+    // MARK: 진도 저장 (iCloud 로 다른 기기와 맞춰짐)
+
+    private func recordResult(_ report: PracticeReport) {
+        let p = progressStore.progress(for: score.id)
+        previousRecord = p.records.filter { $0.partial == (session.focusMeasures != nil && !session.isResuming) }
+            .max { $0.date < $1.date }
+        let record = PracticeRecord(
+            accuracy: report.accuracy, completion: report.completion, mistakes: report.totalMistakes,
+            stars: report.stars, elapsed: report.elapsed, hands: session.handsLabel,
+            partial: session.focusMeasures != nil && !session.isResuming,
+            weakMeasures: report.weakMeasures.map(\.measure),
+            device: UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone")
+        // 끝까지 친 경우(전체 또는 이어서 하기)에만 '이어서 할 위치'를 지움
+        let reachedEnd = session.focusMeasures == nil || session.isResuming
+        progressStore.add(record, for: score.id, clearResume: reachedEnd)
+        if reachedEnd { resumeOffer = nil }
+    }
+
+    private func saveResume() {
+        // 틀린 마디만 연습하는 중에는 곡 진도를 바꾸지 않음
+        guard session.focusMeasures == nil || session.isResuming else { return }
+        guard let m = session.resumeMeasure else { return }
+        progressStore.setResume(measure: m, hands: session.handsLabel, for: score.id)
+    }
+
+    private func resumeBanner(_ m: Int) -> some View {
+        HStack {
+            Image(systemName: "bookmark.fill").foregroundStyle(Color.accentColor)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("지난번 \(m + 1)마디까지 연습했어요").font(.subheadline.weight(.medium))
+                if let hands = progressStore.progress(for: score.id).resumeHands {
+                    Text(hands).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Button("이어서 하기") {
+                session.resume(fromMeasure: m)
+                resumeOffer = nil
+            }
+            .buttonStyle(.borderedProminent)
+            Button("처음부터") { resumeOffer = nil }
+                .buttonStyle(.bordered)
+        }
+        .font(.subheadline)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.accentColor.opacity(0.12))
+    }
+
+    private func measureRangeText(_ focus: Set<Int>) -> String {
+        let sorted = focus.sorted()
+        if let first = sorted.first, let last = sorted.last, last - first + 1 == sorted.count, sorted.count > 2 {
+            return "\(first + 1)–\(last + 1)"
+        }
+        return sorted.map { "\($0 + 1)" }.joined(separator: ", ")
     }
 
     private func focusBanner(_ focus: Set<Int>) -> some View {
         HStack {
-            Image(systemName: "scope")
-            Text("\(focus.sorted().map { "\($0 + 1)" }.joined(separator: ", "))마디만 연습 중")
+            Image(systemName: session.isResuming ? "bookmark" : "scope")
+            Text(session.isResuming ? "\(measureRangeText(focus))마디 이어서 연습 중" : "\(measureRangeText(focus))마디만 연습 중")
                 .font(.subheadline.weight(.medium))
             Spacer()
             Button("곡 전체로") { session.practiceWholePiece() }

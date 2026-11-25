@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 /// 첫 화면: 악보 목록과 가져오기 메뉴
 struct LibraryView: View {
     @EnvironmentObject private var store: ScoreStore
+    @EnvironmentObject private var progress: ProgressStore
 
     @State private var path: [UUID] = []
     @State private var source: ImageSourceKind?
@@ -24,6 +25,12 @@ struct LibraryView: View {
                                  + (score.composer.isEmpty ? "" : " · \(score.composer)"))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            if let last = progress.progress(for: score.id).last {
+                                Text("최근 연습 \(last.accuracy)% " + String(repeating: "★", count: last.stars)
+                                     + " · " + last.date.formatted(.relative(presentation: .named)))
+                                    .font(.caption2)
+                                    .foregroundStyle(Color.accentColor)
+                            }
                         }
                         .padding(.vertical, 4)
                     }
@@ -31,7 +38,9 @@ struct LibraryView: View {
                 .onDelete { store.delete(at: $0) }
             }
             .overlay {
-                if store.scores.isEmpty {
+                if !store.isLoaded {
+                    ProgressView("악보를 불러오는 중…")
+                } else if store.scores.isEmpty {
                     ContentUnavailableView("악보가 없습니다", systemImage: "music.note.list",
                                            description: Text("오른쪽 위 + 버튼으로 악보를 촬영하거나 PDF·사진을 가져오세요."))
                 }
@@ -42,7 +51,17 @@ struct LibraryView: View {
             }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    HStack {
+                        Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                        Button {
+                            alertMessage = store.isCloud
+                                ? "iCloud Drive의 '악보 플레이어' 폴더에 저장하고 있습니다. 같은 Apple ID로 로그인한 iPhone·iPad에서 악보와 연습 기록이 자동으로 맞춰집니다." + (store.downloading > 0 ? "\n지금 \(store.downloading)개를 받는 중입니다." : "")
+                                : "iCloud를 쓸 수 없어 이 기기에만 저장하고 있습니다. 설정 앱 > Apple ID > iCloud > iCloud Drive를 켜고, '악보 플레이어'를 허용하면 기기끼리 맞춰집니다."
+                        } label: {
+                            Image(systemName: store.isCloud ? (store.downloading > 0 ? "icloud.and.arrow.down" : "icloud") : "icloud.slash")
+                        }
+                        .accessibilityLabel("iCloud 동기화 상태")
+                    }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {

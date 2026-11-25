@@ -111,6 +111,8 @@ struct Score: Identifiable, Codable, Hashable {
     var keyFifths: Int = 0
     var measures: [Measure]
     var createdAt: Date = Date()
+    /// 마지막으로 고친 시각 (여러 기기에서 고쳤을 때 최근 것을 남기기 위해)
+    var modifiedAt: Date? = nil
 
     /// 한 마디의 길이 (4분음표 단위)
     var measureLength: Double {

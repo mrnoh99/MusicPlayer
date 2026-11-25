@@ -6,6 +6,10 @@ struct PracticeReportView: View {
     let preferFlats: Bool
     /// 일부 마디만 연습한 결과인지
     let isPartial: Bool
+    /// 지난번 같은 종류의 연습 기록 (비교용)
+    var previous: PracticeRecord? = nil
+    /// 이 악보의 모든 연습 기록 (다른 기기 기록 포함)
+    var history: [PracticeRecord] = []
     let onRetryWeak: () -> Void
     let onRestart: () -> Void
     let onWholePiece: () -> Void
@@ -17,6 +21,7 @@ struct PracticeReportView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     header
+                    comparison
                     statGrid
                     measureStrip
                     if !report.confusions.isEmpty { confusionSection }
@@ -56,6 +61,45 @@ struct PracticeReportView: View {
             }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    // MARK: 지난번과 비교
+
+    @ViewBuilder
+    private var comparison: some View {
+        let full = history.filter { !$0.partial }.sorted { $0.date < $1.date }
+        if previous != nil || full.count > 1 {
+            VStack(alignment: .leading, spacing: 8) {
+                if let prev = previous {
+                    let diff = report.accuracy - prev.accuracy
+                    HStack {
+                        Text("지난번 \(prev.accuracy)% → 이번 \(report.accuracy)%")
+                            .font(.subheadline.weight(.medium))
+                        Spacer()
+                        Text(diff > 0 ? "▲ \(diff)" : diff < 0 ? "▼ \(-diff)" : "그대로")
+                            .font(.subheadline.weight(.bold).monospacedDigit())
+                            .foregroundStyle(diff > 0 ? Color.green : diff < 0 ? Color.red : Color.secondary)
+                    }
+                    Text(prev.date.formatted(.relative(presentation: .named)) + (prev.device.isEmpty ? "" : " · \(prev.device)에서"))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if full.count > 1 {
+                    // 최근 연습 정확도 막대 (iCloud 로 다른 기기의 기록도 함께 보임)
+                    HStack(alignment: .bottom, spacing: 4) {
+                        ForEach(full.suffix(12)) { r in
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(r.accuracy >= 90 ? Color.green : r.accuracy >= 70 ? Color.orange : Color.red)
+                                .frame(height: max(4, CGFloat(r.accuracy) * 0.5))
+                        }
+                    }
+                    .frame(height: 50, alignment: .bottom)
+                    Text("최근 \(min(full.count, 12))번의 곡 전체 연습 · 최고 \(full.map(\.accuracy).max() ?? 0)%")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.gray.opacity(0.08)))
+        }
     }
 
     // MARK: 숫자 요약

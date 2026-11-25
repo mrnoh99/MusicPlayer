@@ -5,6 +5,7 @@ struct ScoreDetailView: View {
     let scoreID: UUID
 
     @EnvironmentObject private var store: ScoreStore
+    @EnvironmentObject private var progress: ProgressStore
     @StateObject private var player = ScorePlayer()
 
     @State private var isEditing = false
@@ -117,6 +118,7 @@ struct ScoreDetailView: View {
         }
         .fullScreenCover(isPresented: $showPractice) {
             PracticeView(score: score.wrappedValue)
+                .environmentObject(progress)
         }
         .alert("PDF 내보내기 실패", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) {
             Button("확인", role: .cancel) {}
@@ -209,7 +211,13 @@ struct ScoreDetailView: View {
 
     private func exportPDF() {
         do {
-            shareURL = try PDFExporter.export(score.wrappedValue)
+            let url = try PDFExporter.export(score.wrappedValue)
+            // iCloud Drive (또는 기기)의 PDF 폴더에도 보관
+            let saved = SyncFolder.folder("PDF").appendingPathComponent(url.lastPathComponent)
+            if let data = try? Data(contentsOf: url) {
+                DispatchQueue.global(qos: .utility).async { SyncFolder.write(data, to: saved) }
+            }
+            shareURL = url
         } catch {
             exportError = error.localizedDescription
         }

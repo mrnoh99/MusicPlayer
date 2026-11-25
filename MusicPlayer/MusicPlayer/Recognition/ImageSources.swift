@@ -99,6 +99,8 @@ enum Keychain {
             kSecAttrAccount as String: key,
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+            // iCloud 키체인으로 같은 Apple ID 기기에 API 키도 함께 맞춰짐
+            kSecAttrSynchronizable as String: kCFBooleanTrue as Any,
         ]
         SecItemAdd(query as CFDictionary, nil)
     }
@@ -110,6 +112,7 @@ enum Keychain {
             kSecAttrAccount as String: key,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
         ]
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
@@ -122,6 +125,7 @@ enum Keychain {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
         ]
         SecItemDelete(query as CFDictionary)
     }

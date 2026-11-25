@@ -38,6 +38,8 @@ final class PracticeSession: ObservableObject {
     }
     /// 일부 마디만 연습 (nil = 전체)
     @Published private(set) var focusMeasures: Set<Int>?
+    /// 지난번 멈춘 곳부터 끝까지 이어서 하는 중
+    @Published private(set) var isResuming = false
 
     let score: Score
     private let mic = MicAnalyzer()
@@ -140,14 +142,35 @@ final class PracticeSession: ObservableObject {
     /// 지정한 마디만 다시 연습
     func practice(measures: Set<Int>) {
         focusMeasures = measures.isEmpty ? nil : measures
+        isResuming = false
+        showReport = false
+        rebuild()
+    }
+
+    /// 지난번 멈춘 마디부터 끝까지
+    func resume(fromMeasure m: Int) {
+        guard m > 0, m < score.measures.count else { return practiceWholePiece() }
+        focusMeasures = Set(m..<score.measures.count)
+        isResuming = true
         showReport = false
         rebuild()
     }
 
     func practiceWholePiece() {
         focusMeasures = nil
+        isResuming = false
         showReport = false
         rebuild()
+    }
+
+    var handsLabel: String {
+        staves.count == 2 ? "양손" : (staves.contains(.treble) ? "오른손" : "왼손")
+    }
+
+    /// 다음에 이어서 할 마디 (전체 곡 기준). 시작 전이거나 끝났으면 nil
+    var resumeMeasure: Int? {
+        guard feedback != .finished, index > 0, let step = current else { return nil }
+        return step.measureIndex
     }
 
     // MARK: 판정
