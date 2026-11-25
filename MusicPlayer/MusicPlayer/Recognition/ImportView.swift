@@ -19,6 +19,8 @@ struct ImportView: View {
     @State private var errorMessage: String?
     @State private var showSettings = false
     @State private var task: Task<Void, Never>?
+    @State private var verify = true
+    @State private var stage: OMRService.Stage = .preparing
 
     var body: some View {
         NavigationStack {
@@ -71,8 +73,16 @@ struct ImportView: View {
 
                 Section {
                     TextField("곡 제목 (선택)", text: $title)
+                    Toggle(isOn: $verify) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("AI 2차 검토")
+                            Text("AI가 처음 읽은 결과를 원본과 마디마다 다시 대조해 고칩니다. 더 정확하지만 시간·비용이 약 2배입니다.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .disabled(isWorking)
                 } footer: {
-                    Text("인식은 Claude(\(OMRService.model))가 이미지를 읽어 악보 데이터로 바꿉니다. 인쇄된 악보에서 가장 정확하며, 결과는 편집 화면에서 고칠 수 있습니다.")
+                    Text("인식은 Claude(\(OMRService.model))가 이미지를 읽어 악보 데이터로 바꿉니다. 사진은 기울기를 펴고 흑백으로 다듬은 뒤 보냅니다. 인쇄된 악보에서 가장 정확하며, 틀린 곳은 편집 화면에서 원본과 비교하며 고치거나 'AI로 이 마디 다시 읽기'로 고칠 수 있습니다.")
                 }
 
                 Section {
@@ -80,7 +90,7 @@ struct ImportView: View {
                         TimelineView(.periodic(from: .now, by: 1)) { context in
                             HStack {
                                 ProgressView()
-                                Text("악보를 읽는 중… \(Int(context.date.timeIntervalSince(startedAt)))초")
+                                Text("\(stage.rawValue)… \(Int(context.date.timeIntervalSince(startedAt)))초")
                                     .padding(.leading, 8)
                             }
                         }
@@ -132,7 +142,9 @@ struct ImportView: View {
         task = Task {
             do {
                 let score = try await OMRService(apiKey: APIKeyStore.current)
-                    .recognize(images: images, titleHint: hint)
+                    .recognize(images: images, titleHint: hint, verify: verify) { newStage in
+                        Task { @MainActor in stage = newStage }
+                    }
                 if Task.isCancelled { return }
                 isWorking = false
                 onCreated(score)

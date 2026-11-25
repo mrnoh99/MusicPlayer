@@ -17,6 +17,8 @@ struct ScoreEditorPanel: View {
 
     @State private var tab: Tab = .pitch
     @State private var chordMode = false
+    @State private var isRereading = false
+    @State private var rereadMessage: String?
 
     var body: some View {
         VStack(spacing: 8) {
@@ -185,6 +187,8 @@ struct ScoreEditorPanel: View {
             .toggleStyle(.button)
             .font(.caption)
 
+            aiRereadRow(measureIndex: loc.measure)
+
             HStack {
                 Button { addMeasure() } label: { Label("마디 추가", systemImage: "plus.square") }
                 Spacer()
@@ -248,6 +252,58 @@ struct ScoreEditorPanel: View {
         change(&score.measures[loc.measure].events[loc.event])
         if let e = selected, !e.isRest {
             PianoSynth.shared.preview(e.pitches)
+        }
+    }
+
+    // MARK: AI 다시 읽기
+
+    @ViewBuilder
+    private func aiRereadRow(measureIndex mi: Int) -> some View {
+        let page = score.pages[score.pageIndex(ofMeasure: mi)]
+        HStack {
+            Button {
+                reread(measureIndex: mi, imageName: page.image)
+            } label: {
+                if isRereading {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                        Text("AI가 원본에서 다시 읽는 중…")
+                    }
+                } else {
+                    Label("AI로 이 마디 다시 읽기", systemImage: "sparkles")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(isRereading || page.image == nil)
+            Spacer()
+        }
+        .font(.subheadline)
+        if page.image == nil {
+            Text("원본 사진이 있는 페이지에서만 쓸 수 있어요.").font(.caption).foregroundStyle(.secondary)
+        } else if let msg = rereadMessage {
+            Text(msg).font(.caption).foregroundStyle(msg.hasPrefix("✓") ? Color.green : Color.red)
+        }
+    }
+
+    private func reread(measureIndex mi: Int, imageName: String?) {
+        guard let name = imageName, let image = PageImageStore.load(name) else { return }
+        isRereading = true
+        rereadMessage = nil
+        let snapshot = score
+        Task {
+            do {
+                let measure = try await OMRService(apiKey: APIKeyStore.current)
+                    .rereadMeasure(score: snapshot, measureIndex: mi, pageImage: image)
+                // 그사이 마디가 바뀌지 않았을 때만 적용 (되돌리기로 원래대로 돌릴 수 있음)
+                if score.measures.indices.contains(mi), score.measures[mi].id == measure.id {
+                    score.measures[mi] = measure
+                    selectedID = measure.events.first { $0.staff == .treble }?.id ?? measure.events.first?.id
+                    rereadMessage = "✓ \(mi + 1)마디를 다시 읽었습니다. 마음에 들지 않으면 되돌리기(↶)를 누르세요."
+                }
+            } catch {
+                rereadMessage = error.localizedDescription
+            }
+            isRereading = false
         }
     }
 

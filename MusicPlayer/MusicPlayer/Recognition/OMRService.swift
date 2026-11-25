@@ -28,10 +28,99 @@ struct OMRService {
 
     var apiKey: String
 
-    func recognize(images: [UIImage], titleHint: String?) async throws -> Score {
+    /// 인식 진행 단계 (화면 표시용)
+    enum Stage: String {
+        case preparing = "사진을 다듬는 중"
+        case reading = "AI가 악보를 읽는 중"
+        case verifying = "AI가 원본과 대조해 검토하는 중"
+    }
+
+    /// 악보 이미지 → Score.
+    /// verify 가 true 면 AI 가 첫 결과를 원본과 마디마다 다시 대조해 고칩니다 (더 정확, 시간·비용 약 2배).
+    func recognize(images: [UIImage], titleHint: String?, verify: Bool = true,
+                   progress: @escaping @Sendable (Stage) -> Void = { _ in }) async throws -> Score {
         guard !apiKey.isEmpty else { throw OMRError.missingAPIKey }
         guard !images.isEmpty else { throw OMRError.noImages }
 
+        progress(.preparing)
+        // 기울어진 사진은 펴고, 그림자·색을 줄여 대비를 높임
+        let pages = images.map { ImagePreprocessor.prepare($0) }
+        let imageBlocks = Self.imageContent(pages)
+
+        progress(.reading)
+        var instruction = "Transcribe all \(pages.count) page(s) above, in order, into the JSON format."
+        if let hint = titleHint, !hint.isEmpty { instruction += " The user calls this piece \"\(hint)\"." }
+        let firstData = try await send(system: Self.systemPrompt, schema: Self.schema,
+                                       content: imageBlocks + [["type": "text", "text": instruction]])
+        var result = try decode(OMRResult.self, from: firstData)
+
+        if verify {
+            try Task.checkCancellation()
+            progress(.verifying)
+            let draft = String(data: firstData, encoding: .utf8) ?? ""
+            var review = """
+            Below is a first-pass transcription of the pages above. Proofread it against the images, \
+            measure by measure and staff by staff: wrong pitches (check clefs, ledger lines, key signature and \
+            accidentals), wrong durations or dots, missing or extra notes, rests, chords, ties, articulations, \
+            dynamics, repeat barlines, page numbers, and missing or extra measures. \
+            Return the complete corrected transcription in the same JSON format.
+            """
+            let problems = result.rhythmProblems()
+            if !problems.isEmpty {
+                review += "\nThese measures do not add up to the time signature and need a closer look: "
+                    + problems.joined(separator: "; ") + "."
+            }
+            review += "\n\nFirst-pass transcription:\n" + draft
+            if let checked = try? await send(system: Self.systemPrompt, schema: Self.schema,
+                                             content: imageBlocks + [["type": "text", "text": review]]),
+               let corrected = try? decode(OMRResult.self, from: checked),
+               !corrected.measures.isEmpty {
+                result = corrected
+            }
+        }
+
+        // 원본 이미지를 보관해 두면 편집할 때 나란히 보며 고칠 수 있음
+        let names: [String?] = pages.map { PageImageStore.save($0) }
+        return result.toScore(fallbackTitle: titleHint, pageImages: names)
+    }
+
+    /// 편집 중 한 마디만 AI 로 다시 읽기. 원본 페이지 이미지와 앞뒤 마디를 단서로 줍니다.
+    func rereadMeasure(score: Score, measureIndex mi: Int, pageImage: UIImage) async throws -> Measure {
+        guard !apiKey.isEmpty else { throw OMRError.missingAPIKey }
+        let page = score.pages[score.pageIndex(ofMeasure: mi)]
+        let localNumber = mi - page.measureRange.lowerBound + 1
+
+        func describe(_ index: Int) -> String {
+            guard score.measures.indices.contains(index) else { return "(none)" }
+            return OMRMeasure.json(from: score.measures[index])
+        }
+        let keyText = score.keyFifths == 0 ? "no sharps or flats"
+            : "\(abs(score.keyFifths)) \(score.keyFifths > 0 ? "sharp(s)" : "flat(s)")"
+        let prompt = """
+        This page of sheet music is in \(score.beatsPerMeasure)/\(score.beatUnit) time with \(keyText) in the key signature.
+        Re-read measure number \(localNumber) counted from the first measure at the top-left of this page \
+        (count every measure, including a pickup measure). Use the neighbouring measures to make sure you have \
+        the right one.
+        Previous measure as currently transcribed: \(describe(mi - 1))
+        This measure as currently transcribed (it probably contains mistakes): \(describe(mi))
+        Next measure as currently transcribed: \(describe(mi + 1))
+        Return only that one measure, transcribed carefully, in the JSON format. Use page 1.
+        """
+        let data = try await send(system: Self.systemPrompt, schema: Self.measureSchema,
+                                  content: Self.imageContent([ImagePreprocessor.prepare(pageImage)])
+                                      + [["type": "text", "text": prompt]],
+                                  maxTokens: 8000)
+        let m = try decode(OMRMeasure.self, from: data)
+        var measure = score.measures[mi]
+        measure.events = m.events(measureLength: score.measureLength)
+        measure.repeatStart = m.repeatStart == true ? true : nil
+        measure.repeatEnd = m.repeatEnd == true ? true : nil
+        return measure
+    }
+
+    // MARK: 요청
+
+    private static func imageContent(_ images: [UIImage]) -> [[String: Any]] {
         var content: [[String: Any]] = []
         for (i, image) in images.enumerated() {
             guard let jpeg = image.resizedForUpload().jpegData(compressionQuality: 0.85) else { continue }
@@ -41,18 +130,20 @@ struct OMRService {
                 "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()],
             ])
         }
-        var instruction = "Transcribe all \(images.count) page(s) above, in order, into the JSON format."
-        if let hint = titleHint, !hint.isEmpty { instruction += " The user calls this piece \"\(hint)\"." }
-        content.append(["type": "text", "text": instruction])
+        return content
+    }
 
+    /// Messages API 호출 → 구조화 출력(JSON) 텍스트
+    private func send(system: String, schema: [String: Any], content: [[String: Any]],
+                      maxTokens: Int = 32000) async throws -> Data {
         let body: [String: Any] = [
             "model": Self.model,
-            "max_tokens": 32000,
-            "system": Self.systemPrompt,
+            "max_tokens": maxTokens,
+            "system": system,
             "messages": [["role": "user", "content": content]],
             "output_config": [
                 "effort": "high",
-                "format": ["type": "json_schema", "schema": Self.schema],
+                "format": ["type": "json_schema", "schema": schema],
             ],
             // 안전 분류기로 거절될 경우 서버가 자동으로 다른 모델로 재시도
             "fallbacks": "default",
@@ -88,13 +179,13 @@ struct OMRService {
         let text = blocks.filter { $0["type"] as? String == "text" }
             .compactMap { $0["text"] as? String }
             .joined()
-        guard let textData = text.data(using: .utf8) else { throw OMRError.badResponse("빈 응답") }
+        guard !text.isEmpty, let textData = text.data(using: .utf8) else { throw OMRError.badResponse("빈 응답") }
+        return textData
+    }
 
+    private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         do {
-            let result = try JSONDecoder().decode(OMRResult.self, from: textData)
-            // 원본 이미지를 보관해 두면 편집할 때 나란히 보며 고칠 수 있음
-            let names: [String?] = images.map { PageImageStore.save($0) }
-            return result.toScore(fallbackTitle: titleHint, pageImages: names)
+            return try JSONDecoder().decode(type, from: data)
         } catch {
             throw OMRError.badResponse(error.localizedDescription)
         }
@@ -129,7 +220,7 @@ struct OMRService {
     - "repeatStart" / "repeatEnd": true when the measure begins / ends with a repeat barline.
     """
 
-    static var schema: [String: Any] {
+    static var measureSchema: [String: Any] {
         let event: [String: Any] = [
             "type": "object",
             "properties": [
@@ -155,6 +246,11 @@ struct OMRService {
             "required": ["treble", "bass", "page", "repeatStart", "repeatEnd"],
             "additionalProperties": false,
         ]
+        return measure
+    }
+
+    static var schema: [String: Any] {
+        let measure = measureSchema
         return [
             "type": "object",
             "properties": [
@@ -175,6 +271,22 @@ struct OMRService {
 // MARK: - 응답 형식
 
 private struct OMRResult: Decodable {
+    /// 박자 합이 맞지 않는 마디 (검토 단계에 단서로 전달). 첫 마디는 못갖춘마디일 수 있어 제외.
+    func rhythmProblems() -> [String] {
+        let unit = 4.0 / Double([2, 4, 8].contains(beatUnit) ? beatUnit : 4)
+        let expected = Double(min(12, max(1, beatsPerMeasure))) * unit
+        var problems: [String] = []
+        for (i, m) in measures.enumerated() where i > 0 {
+            for (name, list) in [("treble", m.treble), ("bass", m.bass)] where !list.isEmpty {
+                let total = list.reduce(0.0) { $0 + $1.beats }
+                if abs(total - expected) > 0.01 {
+                    problems.append("measure \(i + 1) \(name) has \(total) beats")
+                }
+            }
+        }
+        return Array(problems.prefix(30))
+    }
+
     let title: String
     let composer: String
     let tempo: Int
@@ -195,12 +307,7 @@ private struct OMRResult: Decodable {
         let length = score.measureLength
         var lastPage = 0
         score.measures = measures.enumerated().map { i, m in
-            var events: [NoteEvent] = []
-            for (staff, list) in [(Staff.treble, m.treble), (Staff.bass, m.bass)] {
-                let converted = list.map { $0.toEvent(staff: staff) }
-                events += converted.isEmpty ? [NoteEvent.rest(length, staff: staff)] : converted
-            }
-            var measure = Measure(events: events)
+            var measure = Measure(events: m.events(measureLength: length))
             measure.repeatStart = m.repeatStart == true ? true : nil
             measure.repeatEnd = m.repeatEnd == true ? true : nil
             // 이미지(페이지)가 바뀌는 마디에서 새 페이지 시작
@@ -224,6 +331,37 @@ private struct OMRMeasure: Decodable {
     let page: Int?
     let repeatStart: Bool?
     let repeatEnd: Bool?
+
+    func events(measureLength: Double) -> [NoteEvent] {
+        var events: [NoteEvent] = []
+        for (staff, list) in [(Staff.treble, treble), (Staff.bass, bass)] {
+            let converted = list.map { $0.toEvent(staff: staff) }
+            events += converted.isEmpty ? [NoteEvent.rest(measureLength, staff: staff)] : converted
+        }
+        return events
+    }
+
+    /// 앱의 마디를 AI 에게 보여 줄 JSON 으로
+    static func json(from m: Measure) -> String {
+        func staff(_ s: Staff) -> [[String: Any]] {
+            m.events(on: s).map { e in
+                let (v, dotted) = NoteValue.decompose(e.duration)
+                let name: String
+                switch v {
+                case .whole: name = "whole"
+                case .half: name = "half"
+                case .quarter: name = "quarter"
+                case .eighth: name = "eighth"
+                case .sixteenth: name = "16th"
+                }
+                return ["notes": e.pitches.sorted().map { NoteName.name($0) }, "duration": name, "dotted": dotted,
+                        "marks": (e.marks ?? []).map(\.rawValue), "dynamic": e.dynamic?.rawValue ?? ""]
+            }
+        }
+        let obj: [String: Any] = ["treble": staff(.treble), "bass": staff(.bass)]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return "{}" }
+        return String(data: data, encoding: .utf8) ?? "{}"
+    }
 }
 
 private struct OMREvent: Decodable {
@@ -232,6 +370,19 @@ private struct OMREvent: Decodable {
     let dotted: Bool
     let marks: [String]?
     let dynamic: String?
+
+    /// 4분음표 = 1 박 기준 길이
+    var beats: Double {
+        let base: Double
+        switch duration {
+        case "whole": base = 4
+        case "half": base = 2
+        case "eighth": base = 0.5
+        case "16th": base = 0.25
+        default: base = 1
+        }
+        return base * (dotted ? 1.5 : 1)
+    }
 
     func toEvent(staff: Staff) -> NoteEvent {
         let base: Double
