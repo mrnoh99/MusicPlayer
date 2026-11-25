@@ -7,11 +7,8 @@ struct LibraryView: View {
     @EnvironmentObject private var store: ScoreStore
 
     @State private var path: [UUID] = []
-    @State private var showScanner = false
-    @State private var showPhotos = false
-    @State private var showFiles = false
+    @State private var source: ImageSourceKind?
     @State private var showSettings = false
-    @State private var photoItems: [PhotosPickerItem] = []
     @State private var importBatch: ImportBatch?
     @State private var alertMessage: String?
 
@@ -22,7 +19,8 @@ struct LibraryView: View {
                     NavigationLink(value: score.id) {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(score.title).font(.headline)
-                            Text("\(score.measures.count)마디 · \(score.beatsPerMeasure)/\(score.beatUnit) · ♩=\(score.tempo)"
+                            Text((score.pageCount > 1 ? "\(score.pageCount)쪽 · " : "")
+                                 + "\(score.measures.count)마디 · \(score.beatsPerMeasure)/\(score.beatUnit) · ♩=\(score.tempo)"
                                  + (score.composer.isEmpty ? "" : " · \(score.composer)"))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -48,15 +46,9 @@ struct LibraryView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
-                        Button {
-                            if DocumentScannerView.isSupported {
-                                showScanner = true
-                            } else {
-                                alertMessage = "이 기기에서는 카메라 스캔을 사용할 수 없습니다. (시뮬레이터에서는 사진이나 파일 가져오기를 사용하세요.)"
-                            }
-                        } label: { Label("카메라로 악보 촬영", systemImage: "camera") }
-                        Button { showPhotos = true } label: { Label("사진에서 가져오기", systemImage: "photo.on.rectangle") }
-                        Button { showFiles = true } label: { Label("PDF · 이미지 파일", systemImage: "doc") }
+                        ImageSourceButtons(source: $source) {
+                            alertMessage = "이 기기에서는 카메라 스캔을 사용할 수 없습니다. (시뮬레이터에서는 사진이나 파일 가져오기를 사용하세요.)"
+                        }
                         Divider()
                         Button {
                             let s = Score.blank()
@@ -71,33 +63,8 @@ struct LibraryView: View {
                     }
                 }
             }
-            .fullScreenCover(isPresented: $showScanner) {
-                DocumentScannerView(onFinish: { images in
-                    showScanner = false
-                    if !images.isEmpty { importBatch = ImportBatch(images: images) }
-                }, onCancel: {
-                    showScanner = false
-                })
-                .ignoresSafeArea()
-            }
-            .photosPicker(isPresented: $showPhotos, selection: $photoItems, maxSelectionCount: 20, matching: .images)
-            .onChange(of: photoItems) { _, items in
-                guard !items.isEmpty else { return }
-                Task { await loadPhotos(items) }
-            }
-            .fileImporter(isPresented: $showFiles, allowedContentTypes: [.pdf, .image], allowsMultipleSelection: true) { result in
-                switch result {
-                case .success(let urls):
-                    let images = urls.flatMap { ImageFileLoader.images(from: $0) }
-                    if images.isEmpty {
-                        alertMessage = "파일을 읽지 못했습니다."
-                    } else {
-                        importBatch = ImportBatch(images: images)
-                    }
-                case .failure(let error):
-                    alertMessage = error.localizedDescription
-                }
-            }
+            .imageImporter(source: $source, onImages: { importBatch = ImportBatch(images: $0) },
+                           onError: { alertMessage = $0 })
             .sheet(item: $importBatch) { batch in
                 ImportView(batch: batch) { score in
                     store.add(score)
@@ -115,20 +82,6 @@ struct LibraryView: View {
         }
     }
 
-    private func loadPhotos(_ items: [PhotosPickerItem]) async {
-        var images: [UIImage] = []
-        for item in items {
-            if let data = try? await item.loadTransferable(type: Data.self), let image = UIImage(data: data) {
-                images.append(image)
-            }
-        }
-        photoItems = []
-        if images.isEmpty {
-            alertMessage = "사진을 불러오지 못했습니다."
-        } else {
-            importBatch = ImportBatch(images: images)
-        }
-    }
 }
 
 /// 설정: API 키

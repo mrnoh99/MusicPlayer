@@ -42,7 +42,9 @@ enum PDFExporter {
             }
 
             for system in layout.systems {
-                if y + ScoreLayout.systemHeight > page.height - margin {
+                // 책의 새 페이지는 PDF 에서도 새 쪽에서 시작
+                let bookPageBreak = system.index > 0 && system.startsPage != nil
+                if bookPageBreak || y + ScoreLayout.systemHeight > page.height - margin {
                     newPage()
                 }
                 cg.saveGState()

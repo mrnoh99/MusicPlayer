@@ -92,7 +92,9 @@ struct OMRService {
 
         do {
             let result = try JSONDecoder().decode(OMRResult.self, from: textData)
-            return result.toScore(fallbackTitle: titleHint)
+            // 원본 이미지를 보관해 두면 편집할 때 나란히 보며 고칠 수 있음
+            let names: [String?] = images.map { PageImageStore.save($0) }
+            return result.toScore(fallbackTitle: titleHint, pageImages: names)
         } catch {
             throw OMRError.badResponse(error.localizedDescription)
         }
@@ -121,6 +123,10 @@ struct OMRService {
     - keyFifths: number of sharps (positive) or flats (negative) in the key signature.
     - tempo: quarter-note BPM if marked, otherwise a sensible value for the tempo word, or 90.
     - title / composer: as printed, or empty strings.
+    - "page": the number of the image (1, 2, …) on which the measure is printed.
+    - "marks" per event: staccato, accent, tenuto, fermata, and "tie" when the note is tied to the next     note on the same staff. Use an empty array when there are none.
+    - "dynamic" per event: the dynamic marking (pp, p, mp, mf, f, ff) that starts at this event, otherwise "".
+    - "repeatStart" / "repeatEnd": true when the measure begins / ends with a repeat barline.
     """
 
     static var schema: [String: Any] {
@@ -130,8 +136,11 @@ struct OMRService {
                 "notes": ["type": "array", "items": ["type": "string"]],
                 "duration": ["type": "string", "enum": ["whole", "half", "quarter", "eighth", "16th"]],
                 "dotted": ["type": "boolean"],
+                "marks": ["type": "array", "items": ["type": "string",
+                          "enum": ["staccato", "accent", "tenuto", "fermata", "tie"]]],
+                "dynamic": ["type": "string", "enum": ["", "pp", "p", "mp", "mf", "f", "ff"]],
             ],
-            "required": ["notes", "duration", "dotted"],
+            "required": ["notes", "duration", "dotted", "marks", "dynamic"],
             "additionalProperties": false,
         ]
         let measure: [String: Any] = [
@@ -139,8 +148,11 @@ struct OMRService {
             "properties": [
                 "treble": ["type": "array", "items": event],
                 "bass": ["type": "array", "items": event],
+                "page": ["type": "integer"],
+                "repeatStart": ["type": "boolean"],
+                "repeatEnd": ["type": "boolean"],
             ],
-            "required": ["treble", "bass"],
+            "required": ["treble", "bass", "page", "repeatStart", "repeatEnd"],
             "additionalProperties": false,
         ]
         return [
@@ -171,7 +183,8 @@ private struct OMRResult: Decodable {
     let keyFifths: Int
     let measures: [OMRMeasure]
 
-    func toScore(fallbackTitle: String?) -> Score {
+    /// pageImages: 페이지(이미지) 순서대로 저장한 원본 이미지 파일 이름
+    func toScore(fallbackTitle: String?, pageImages: [String?] = []) -> Score {
         var score = Score(title: title.isEmpty ? (fallbackTitle?.isEmpty == false ? fallbackTitle! : "인식한 악보") : title,
                           composer: composer,
                           tempo: min(240, max(30, tempo)),
@@ -180,15 +193,27 @@ private struct OMRResult: Decodable {
                           keyFifths: min(7, max(-7, keyFifths)),
                           measures: [])
         let length = score.measureLength
-        score.measures = measures.map { m in
+        var lastPage = 0
+        score.measures = measures.enumerated().map { i, m in
             var events: [NoteEvent] = []
             for (staff, list) in [(Staff.treble, m.treble), (Staff.bass, m.bass)] {
                 let converted = list.map { $0.toEvent(staff: staff) }
                 events += converted.isEmpty ? [NoteEvent.rest(length, staff: staff)] : converted
             }
-            return Measure(events: events)
+            var measure = Measure(events: events)
+            measure.repeatStart = m.repeatStart == true ? true : nil
+            measure.repeatEnd = m.repeatEnd == true ? true : nil
+            // 이미지(페이지)가 바뀌는 마디에서 새 페이지 시작
+            let page = max(1, m.page ?? max(lastPage, 1))
+            if i == 0 || page > lastPage {
+                if i > 0 { measure.pageStart = true }
+                if pageImages.indices.contains(page - 1) { measure.pageImage = pageImages[page - 1] }
+                lastPage = max(page, 1)
+            }
+            return measure
         }
         if score.measures.isEmpty { score.measures = [score.emptyMeasure()] }
+        if score.measures[0].pageImage == nil, let first = pageImages.first ?? nil { score.measures[0].pageImage = first }
         return score
     }
 }
@@ -196,12 +221,17 @@ private struct OMRResult: Decodable {
 private struct OMRMeasure: Decodable {
     let treble: [OMREvent]
     let bass: [OMREvent]
+    let page: Int?
+    let repeatStart: Bool?
+    let repeatEnd: Bool?
 }
 
 private struct OMREvent: Decodable {
     let notes: [String]
     let duration: String
     let dotted: Bool
+    let marks: [String]?
+    let dynamic: String?
 
     func toEvent(staff: Staff) -> NoteEvent {
         let base: Double
@@ -213,7 +243,11 @@ private struct OMREvent: Decodable {
         default: base = 1
         }
         let pitches = Array(Set(notes.compactMap(NoteName.midi(from:)).filter { (21...108).contains($0) })).sorted()
-        return NoteEvent(pitches: pitches, duration: base * (dotted ? 1.5 : 1), staff: staff)
+        var event = NoteEvent(pitches: pitches, duration: base * (dotted ? 1.5 : 1), staff: staff)
+        let parsed = Array(Set((marks ?? []).compactMap(NoteMark.init(rawValue:))))
+        event.marks = parsed.isEmpty ? nil : parsed.sorted { $0.rawValue < $1.rawValue }
+        event.dynamic = dynamic.flatMap(Dynamic.init(rawValue:))
+        return event
     }
 }
 

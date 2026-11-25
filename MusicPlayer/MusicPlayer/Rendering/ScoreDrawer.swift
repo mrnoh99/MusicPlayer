@@ -88,6 +88,29 @@ struct ScoreDrawer {
             ctx.strokePath()
         }
 
+        // 도돌이표
+        for (k, mi) in system.measureRange.enumerated() {
+            let m = score.measures[mi]
+            if m.repeatStart == true { drawRepeat(at: system.barXs[k], start: true, in: ctx) }
+            if m.repeatEnd == true { drawRepeat(at: system.barXs[k + 1], start: false, in: ctx) }
+        }
+
+        // 페이지 표시
+        if let page = system.startsPage {
+            let label = NSAttributedString(string: "📄 " + page.displayTitle, attributes: [
+                .font: UIFont.boldSystemFont(ofSize: 11), .foregroundColor: UIColor.systemIndigo])
+            label.draw(at: CGPoint(x: left + 4, y: 2))
+            if system.index > 0 {
+                ctx.setStrokeColor(UIColor.systemIndigo.withAlphaComponent(0.35).cgColor)
+                ctx.setLineWidth(1)
+                ctx.setLineDash(phase: 0, lengths: [4, 3])
+                ctx.move(to: CGPoint(x: left + label.size().width + 12, y: 9))
+                ctx.addLine(to: CGPoint(x: right, y: 9))
+                ctx.strokePath()
+                ctx.setLineDash(phase: 0, lengths: [])
+            }
+        }
+
         // 마디 번호
         if let first = system.measureRange.first, let x = system.barXs.first {
             drawText("\(first + 1)", size: 10, color: .gray,
@@ -149,10 +172,12 @@ struct ScoreDrawer {
             }
         }
 
-        // 기둥 + 꼬리
-        guard value != .whole else { return }
         let avg = Double(low + high) / 2
         let up = avg < 4
+        drawMarks(e, x: x, low: low, high: high, stemUp: up, hw: hw, in: ctx, color: color)
+
+        // 기둥 + 꼬리
+        guard value != .whole else { return }
         let stemX = up ? x + hw / 2 - 0.6 : x - hw / 2 + 0.6
         let startY = ScoreLayout.y(position: up ? low : high, staff: e.staff)
         let endY = up ? ScoreLayout.y(position: high, staff: e.staff) - 3.5 * s
@@ -172,6 +197,76 @@ struct ScoreDrawer {
                              control: CGPoint(x: stemX + s * 1.3, y: fy + dir * s * 0.9))
         }
         ctx.strokePath()
+    }
+
+    // MARK: 표식 (스타카토·악센트·페르마타·붙임줄·셈여림·손가락 번호)
+
+    private func drawMarks(_ e: NoteEvent, x: CGFloat, low: Int, high: Int, stemUp: Bool,
+                           hw: CGFloat, in ctx: CGContext, color: UIColor) {
+        let st = e.staff
+        // 기둥 반대쪽(음표 머리 쪽)에 붙는 표식
+        var markY = stemUp ? ScoreLayout.y(position: min(low, 0) - 2, staff: st) + 2
+                           : ScoreLayout.y(position: max(high, 8) + 2, staff: st) - 2
+        let step: CGFloat = stemUp ? s * 1.1 : -s * 1.1
+        for mark in [NoteMark.staccato, .tenuto, .accent] where e.has(mark) {
+            switch mark {
+            case .staccato:
+                ctx.setFillColor(color.cgColor)
+                ctx.fillEllipse(in: CGRect(x: x - 1.8, y: markY - 1.8, width: 3.6, height: 3.6))
+            case .tenuto:
+                ctx.setStrokeColor(color.cgColor)
+                ctx.setLineWidth(1.4)
+                ctx.move(to: CGPoint(x: x - hw * 0.6, y: markY))
+                ctx.addLine(to: CGPoint(x: x + hw * 0.6, y: markY))
+                ctx.strokePath()
+            default:
+                ctx.setStrokeColor(color.cgColor)
+                ctx.setLineWidth(1.2)
+                ctx.move(to: CGPoint(x: x - hw * 0.7, y: markY - s * 0.4))
+                ctx.addLine(to: CGPoint(x: x + hw * 0.7, y: markY))
+                ctx.addLine(to: CGPoint(x: x - hw * 0.7, y: markY + s * 0.4))
+                ctx.strokePath()
+            }
+            markY += step
+        }
+
+        // 페르마타: 항상 위
+        let topY = ScoreLayout.y(position: max(high, 8) + 3, staff: st)
+        if e.has(.fermata) {
+            ctx.setStrokeColor(color.cgColor)
+            ctx.setLineWidth(1.3)
+            ctx.addArc(center: CGPoint(x: x, y: topY + s * 0.5), radius: s * 1.1,
+                       startAngle: .pi, endAngle: 0, clockwise: false)
+            ctx.strokePath()
+            ctx.setFillColor(color.cgColor)
+            ctx.fillEllipse(in: CGRect(x: x - 1.6, y: topY - 1.2, width: 3.2, height: 3.2))
+        }
+
+        // 손가락 번호: 음표 위
+        if let f = e.fingering {
+            drawText("\(f)", size: 10, bold: true, color: color,
+                     center: CGPoint(x: x, y: topY - (e.has(.fermata) ? s * 1.6 : 0)))
+        }
+
+        // 붙임줄: 다음 음 쪽으로 짧은 호
+        if e.has(.tie) {
+            let y0 = ScoreLayout.y(position: stemUp ? low : high, staff: st) + (stemUp ? s * 0.9 : -s * 0.9)
+            ctx.setStrokeColor(color.cgColor)
+            ctx.setLineWidth(1.2)
+            ctx.move(to: CGPoint(x: x + hw * 0.6, y: y0))
+            ctx.addQuadCurve(to: CGPoint(x: x + hw * 3.4, y: y0),
+                             control: CGPoint(x: x + hw * 2, y: y0 + (stemUp ? s * 1.1 : -s * 1.1)))
+            ctx.strokePath()
+        }
+
+        // 셈여림: 오선 아래
+        if let d = e.dynamic {
+            let y = ScoreLayout.y(position: -5, staff: st)
+            let font = UIFont.italicSystemFont(ofSize: 13).withBold()
+            let str = NSAttributedString(string: d.rawValue, attributes: [.font: font, .foregroundColor: color])
+            let sz = str.size()
+            str.draw(at: CGPoint(x: x - sz.width / 2, y: y - sz.height / 2))
+        }
     }
 
     private func ledger(at position: Int, x: CGFloat, hw: CGFloat, staff: Staff, ctx: CGContext) {
@@ -236,6 +331,26 @@ struct ScoreDrawer {
         }
     }
 
+    private func drawRepeat(at x: CGFloat, start: Bool, in ctx: CGContext) {
+        let top = ScoreLayout.trebleTop, bottom = ScoreLayout.bassTop + 4 * s
+        let thickX = start ? x + 1 : x - 4
+        let thinX = start ? x + 7 : x - 7
+        let dotX = start ? x + 11 : x - 11
+        ctx.setFillColor(ink.cgColor)
+        ctx.fill(CGRect(x: thickX, y: top, width: 3, height: bottom - top))
+        ctx.setStrokeColor(ink.cgColor)
+        ctx.setLineWidth(1)
+        ctx.move(to: CGPoint(x: thinX, y: top))
+        ctx.addLine(to: CGPoint(x: thinX, y: bottom))
+        ctx.strokePath()
+        for staff in Staff.allCases {
+            for p in [3, 5] {
+                let y = ScoreLayout.y(position: p, staff: staff)
+                ctx.fillEllipse(in: CGRect(x: dotX - 1.8, y: y - 1.8, width: 3.6, height: 3.6))
+            }
+        }
+    }
+
     private func drawBrace(in ctx: CGContext, x: CGFloat, top: CGFloat, bottom: CGFloat) {
         let mid = (top + bottom) / 2
         let w: CGFloat = 6
@@ -282,5 +397,12 @@ private extension ScoreLayout {
     static func y(position: Double, staff: Staff) -> CGFloat {
         let top = staff == .treble ? trebleTop : bassTop
         return top + 4 * space - CGFloat(position) * space / 2
+    }
+}
+
+private extension UIFont {
+    func withBold() -> UIFont {
+        guard let d = fontDescriptor.withSymbolicTraits(fontDescriptor.symbolicTraits.union(.traitBold)) else { return self }
+        return UIFont(descriptor: d, size: pointSize)
     }
 }

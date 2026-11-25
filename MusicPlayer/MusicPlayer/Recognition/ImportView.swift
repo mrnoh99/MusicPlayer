@@ -8,6 +8,8 @@ struct ImportBatch: Identifiable {
 /// 가져온 페이지를 확인하고 인식을 실행하는 화면
 struct ImportView: View {
     @State var batch: ImportBatch
+    /// "악보 가져오기" 또는 "페이지 추가"
+    var screenTitle = "악보 가져오기"
     var onCreated: (Score) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -21,7 +23,7 @@ struct ImportView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("페이지 (\(batch.images.count))") {
+                Section {
                     ScrollView(.horizontal) {
                         HStack(spacing: 10) {
                             ForEach(Array(batch.images.enumerated()), id: \.offset) { i, image in
@@ -32,7 +34,21 @@ struct ImportView: View {
                                         .frame(height: 180)
                                         .border(.gray.opacity(0.4))
                                     HStack {
-                                        Text("\(i + 1)").font(.caption)
+                                        if i > 0 && !isWorking {
+                                            Button {
+                                                batch.images.swapAt(i, i - 1)
+                                            } label: { Image(systemName: "chevron.left.circle") }
+                                            .buttonStyle(.borderless)
+                                            .accessibilityLabel("앞으로")
+                                        }
+                                        Text("\(i + 1)쪽").font(.caption)
+                                        if i < batch.images.count - 1 && !isWorking {
+                                            Button {
+                                                batch.images.swapAt(i, i + 1)
+                                            } label: { Image(systemName: "chevron.right.circle") }
+                                            .buttonStyle(.borderless)
+                                            .accessibilityLabel("뒤로")
+                                        }
                                         if batch.images.count > 1 && !isWorking {
                                             Button(role: .destructive) {
                                                 batch.images.remove(at: i)
@@ -47,6 +63,10 @@ struct ImportView: View {
                         }
                         .padding(.vertical, 4)
                     }
+                } header: {
+                    Text("페이지 (\(batch.images.count))")
+                } footer: {
+                    Text("‹ › 로 페이지 순서를 바꾸고, ⓧ 로 뺄 수 있습니다. 인식한 뒤에도 페이지 관리에서 순서를 바꿀 수 있어요.")
                 }
 
                 Section {
@@ -88,7 +108,7 @@ struct ImportView: View {
                     }
                 }
             }
-            .navigationTitle("악보 가져오기")
+            .navigationTitle(screenTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

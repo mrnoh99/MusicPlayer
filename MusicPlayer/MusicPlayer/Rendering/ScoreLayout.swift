@@ -24,6 +24,8 @@ struct ScoreLayout {
         /// 마디 경계 x (measureRange.count + 1 개)
         let barXs: [CGFloat]
         let events: [PlacedEvent]
+        /// 이 줄에서 새 페이지가 시작되면 그 페이지 (여러 페이지인 악보에서만)
+        var startsPage: ScorePage? = nil
     }
 
     let score: Score
@@ -41,11 +43,17 @@ struct ScoreLayout {
         let baseHeader: CGFloat = 34 + keyCount * 8 + 6
         let perSystem = max(1, Int((usable - baseHeader) / 170))
 
+        let pages = score.pages
+        let showPages = pages.count > 1 || pages.first?.title != nil
+        let pageStarts = pages.map(\.measureRange.lowerBound)
+
         var systems: [System] = []
         var start = 0
         var index = 0
         while start < score.measures.count {
-            let end = min(start + perSystem, score.measures.count)
+            // 페이지가 바뀌는 마디에서는 줄을 바꿈
+            let nextPage = pageStarts.first { $0 > start } ?? score.measures.count
+            let end = min(start + perSystem, score.measures.count, nextPage)
             let header = baseHeader + (index == 0 ? 26 : 0)
             let x0 = Self.leftMargin + header
             let measureWidth = (Self.leftMargin + usable - x0) / CGFloat(perSystem)
@@ -66,8 +74,10 @@ struct ScoreLayout {
                 }
             }
             bars.append(x0 + CGFloat(end - start) * measureWidth)
-            systems.append(System(index: index, measureRange: start..<end, headerWidth: header,
-                                  barXs: bars, events: placed))
+            var system = System(index: index, measureRange: start..<end, headerWidth: header,
+                                barXs: bars, events: placed)
+            if showPages { system.startsPage = pages.first { $0.measureRange.lowerBound == start } }
+            systems.append(system)
             start = end
             index += 1
         }

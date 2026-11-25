@@ -13,9 +13,15 @@ final class ScoreStore: ObservableObject {
     }()
 
     init() {
-        load()
+        let loaded = load()
         if scores.isEmpty {
             scores = [.twinkleExample]
+        }
+        // 저장 파일을 제대로 읽었을 때만 정리 (읽기 실패 시 이미지를 잃지 않도록)
+        guard loaded else { return }
+        let used = Set(scores.flatMap { $0.measures.compactMap(\.pageImage) })
+        DispatchQueue.global(qos: .utility).async {
+            PageImageStore.removeUnused(keeping: used)
         }
     }
 
@@ -46,12 +52,15 @@ final class ScoreStore: ObservableObject {
         scores.remove(atOffsets: offsets)
     }
 
-    private func load() {
-        guard let data = try? Data(contentsOf: fileURL) else { return }
+    @discardableResult
+    private func load() -> Bool {
+        guard let data = try? Data(contentsOf: fileURL) else { return true }
         do {
             scores = try JSONDecoder().decode([Score].self, from: data)
+            return true
         } catch {
             print("악보 불러오기 실패: \(error)")
+            return false
         }
     }
 

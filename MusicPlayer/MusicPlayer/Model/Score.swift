@@ -17,17 +17,83 @@ struct NoteEvent: Identifiable, Codable, Hashable {
     /// 4분음표 = 1.0 박
     var duration: Double
     var staff: Staff
+    /// 스타카토·악센트 같은 표식 (옛 저장 파일 호환을 위해 옵셔널)
+    var marks: [NoteMark]? = nil
+    /// 셈여림 (이 음부터 적용)
+    var dynamic: Dynamic? = nil
+    /// 손가락 번호 1~5
+    var fingering: Int? = nil
 
     var isRest: Bool { pitches.isEmpty }
+
+    func has(_ mark: NoteMark) -> Bool { marks?.contains(mark) ?? false }
+
+    mutating func toggle(_ mark: NoteMark) {
+        var m = marks ?? []
+        if let i = m.firstIndex(of: mark) { m.remove(at: i) } else { m.append(mark) }
+        marks = m.isEmpty ? nil : m
+    }
 
     static func rest(_ duration: Double, staff: Staff) -> NoteEvent {
         NoteEvent(pitches: [], duration: duration, staff: staff)
     }
 }
 
+/// 음표에 붙는 표식
+enum NoteMark: String, Codable, CaseIterable, Identifiable {
+    case staccato, accent, tenuto, fermata, tie
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .staccato: return "스타카토"
+        case .accent: return "악센트"
+        case .tenuto: return "테누토"
+        case .fermata: return "페르마타"
+        case .tie: return "붙임줄"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .staccato: return "•"
+        case .accent: return ">"
+        case .tenuto: return "–"
+        case .fermata: return "𝄐"
+        case .tie: return "‿"
+        }
+    }
+}
+
+/// 셈여림표
+enum Dynamic: String, Codable, CaseIterable, Identifiable {
+    case pp, p, mp, mf, f, ff
+
+    var id: String { rawValue }
+    /// 재생 세기
+    var velocity: Double {
+        switch self {
+        case .pp: return 0.35
+        case .p: return 0.48
+        case .mp: return 0.6
+        case .mf: return 0.72
+        case .f: return 0.86
+        case .ff: return 1.0
+        }
+    }
+}
+
 struct Measure: Identifiable, Codable, Hashable {
     var id: UUID = UUID()
     var events: [NoteEvent]
+    /// 이 마디에서 새 페이지가 시작됨 (첫 마디는 항상 1쪽 시작). 옛 저장 파일과 호환되도록 옵셔널.
+    var pageStart: Bool? = nil
+    /// 페이지 이름 (pageStart 인 마디에만 의미 있음)
+    var pageTitle: String? = nil
+    /// 페이지 원본 이미지 파일 이름 (pageStart 인 마디 또는 첫 마디)
+    var pageImage: String? = nil
+    /// 도돌이표 시작 / 끝
+    var repeatStart: Bool? = nil
+    var repeatEnd: Bool? = nil
 
     func events(on staff: Staff) -> [NoteEvent] {
         events.filter { $0.staff == staff }
